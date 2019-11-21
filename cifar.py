@@ -1,40 +1,39 @@
 import os
 import sys
 import time
-import torch
 import pickle
 import numpy as np
 import nvidia.dali.ops as ops
 import nvidia.dali.types as types
 from sklearn.utils import shuffle
-from torchvision.datasets import CIFAR10
 from nvidia.dali.pipeline import Pipeline
-import torchvision.transforms as transforms
-from nvidia.dali.plugin.pytorch import DALIClassificationIterator, DALIGenericIterator
+from nvidia.dali.plugin.pytorch import DALIClassificationIterator
 
 
 class HybridTrainPipe_CIFAR(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop=32, dali_cpu=False, local_rank=0,
-                 world_size=1,
-                 cutout=0,
-                 INPUT_ITERATOR=None):
+    def __init__(self,
+                 batch_size,
+                 num_threads,
+                 device_id,
+                 crop=32,
+                 input_iterator=None):
         super(HybridTrainPipe_CIFAR, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        assert INPUT_ITERATOR is not None
-        self.iterator = iter(INPUT_ITERATOR(batch_size, 'train', root=data_dir))
-        dali_device = "gpu"
+        assert input_iterator is not None
+        self.iterator = iter(input_iterator)
+
         self.input = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
-        self.pad = ops.Paste(device=dali_device, ratio=1.25, fill_value=0)
+
+        # Augmentation operations
         self.uniform = ops.Uniform(range=(0., 1.))
-        self.crop = ops.Crop(device=dali_device, crop_h=crop, crop_w=crop)
-        self.cmnp = ops.CropMirrorNormalize(device="gpu",
-                                            output_dtype=types.FLOAT,
-                                            output_layout=types.NCHW,
+        self.coin = ops.CoinFlip(probability=0.5)
+
+        self.pad = ops.Paste(device="gpu", ratio=1.25, fill_value=0)
+        self.crop = ops.Crop(device="gpu", crop_h=crop, crop_w=crop)
+        self.cmnp = ops.CropMirrorNormalize(device="gpu", output_dtype=types.FLOAT, output_layout=types.NCHW,
                                             image_type=types.RGB,
                                             mean=[0.49139968 * 255., 0.48215827 * 255., 0.44653124 * 255.],
-                                            std=[0.24703233 * 255., 0.24348505 * 255., 0.26158768 * 255.]
-                                            )
-        self.coin = ops.CoinFlip(probability=0.5)
+                                            std=[0.24703233 * 255., 0.24348505 * 255., 0.26158768 * 255.])
 
     def iter_setup(self):
         (images, labels) = self.iterator.next()
@@ -53,12 +52,15 @@ class HybridTrainPipe_CIFAR(Pipeline):
 
 
 class HybridValPipe_CIFAR(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size, local_rank=0, world_size=1,
-                 INPUT_ITERATOR = None):
+    def __init__(self,
+                 batch_size,
+                 num_threads,
+                 device_id,
+                 input_iterator = None):
 
         super(HybridValPipe_CIFAR, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        assert INPUT_ITERATOR is not None
-        self.iterator = iter(INPUT_ITERATOR(batch_size, 'val', root=data_dir))
+        assert input_iterator is not None
+        self.iterator = iter(input_iterator)
         self.input = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
         self.cmnp = ops.CropMirrorNormalize(device="gpu",
@@ -82,8 +84,8 @@ class HybridValPipe_CIFAR(Pipeline):
         return [output, self.labels]
 
 
-class CIFAR_INPUT_ITER():
-    def __init__(self, batch_size, type='train', root='/userhome/memory_data/cifar10'):
+class CifarInputIterator:
+    def __init__(self, batch_size, type='train', root='/userhome/memory_data/cifar10', indices=None):
         self.root = root
         self.batch_size = batch_size
         self.train = (type == 'train')
@@ -110,6 +112,9 @@ class CIFAR_INPUT_ITER():
         self.data = np.vstack(self.data).reshape(-1, 3, 32, 32)
         self.targets = np.vstack(self.targets)
         self.data = self.data.transpose((0, 2, 3, 1))  # convert to HWC
+        if indices is not None:
+            self.data = self.data[indices]
+            self.targets = self.targets[indices]
 
     def __iter__(self):
         self.i = 0
@@ -132,7 +137,7 @@ class CIFAR_INPUT_ITER():
     next = __next__
 
 
-class CIFAR10_INPUT_ITER(CIFAR_INPUT_ITER):
+class Cifar10InputIterator(CifarInputIterator):
     base_folder = 'cifar-10-batches-py'
     train_list = [
         ['data_batch_1', 'c99cafc152244af753f735de768cd75f'],
@@ -147,88 +152,91 @@ class CIFAR10_INPUT_ITER(CIFAR_INPUT_ITER):
     ]
 
     def __init__(self, *args, **kwargs):
-        super(CIFAR10_INPUT_ITER, self).__init__(*args, **kwargs)
+        super(Cifar10InputIterator, self).__init__(*args, **kwargs)
 
 
-class CIFAR100_INPUT_ITER(CIFAR_INPUT_ITER):
+class Cifar100InputIterator(CifarInputIterator):
     base_folder = 'cifar-100-python'
     train_list = [['train', '']]
     test_list = [['test', '']]
 
     def __init__(self, *args, **kwargs):
-        super(CIFAR100_INPUT_ITER, self).__init__(*args, **kwargs)
+        super(Cifar100InputIterator, self).__init__(*args, **kwargs)
 
 
-def get_cifar_iter_dali(type, image_dir, batch_size, num_threads, local_rank=0, world_size=1, val_size=32, cutout=0,
-                        version="cifar10"):
-    INPUT_ITERATOR = CIFAR10_INPUT_ITER if version == "cifar10" else CIFAR100_INPUT_ITER
+def get_cifar_iter_dali(
+        type,
+        image_dir,
+        batch_size,
+        num_threads,
+        val_ratio=0,
+        local_rank=0,
+        version="cifar10"
+):
+
+    InputIterator = Cifar10InputIterator if version == "cifar10" else Cifar100InputIterator
     if type == 'train':
-        pip_train = HybridTrainPipe_CIFAR(batch_size=batch_size, num_threads=num_threads, device_id=local_rank,
-                                          data_dir=image_dir,
-                                          crop=32, world_size=world_size, local_rank=local_rank, cutout=cutout,
-                                          INPUT_ITERATOR=INPUT_ITERATOR)
+        if val_ratio != 0:
+            all_idxs = np.random.RandomState(seed=42).permutation(50000)
+            num_tr_samples = int(50000*(1-val_ratio))
+            tr_idxs = all_idxs[:num_tr_samples]
+            val_idxs = all_idxs[num_tr_samples:]
+        else:
+            tr_idxs = range(50000)
+            val_idxs = []
+
+        pip_train = HybridTrainPipe_CIFAR(batch_size=batch_size, num_threads=num_threads,
+                                          device_id=local_rank, crop=32,
+                                          input_iterator=InputIterator(batch_size, root=image_dir, indices=tr_idxs))
         pip_train.build()
-        dali_iter_train = DALIClassificationIterator(pip_train, size=50000 // world_size)
-        return dali_iter_train
+        dali_iter_train = DALIClassificationIterator(pip_train, size=len(tr_idxs))
 
-    elif type == 'val':
-        pip_val = HybridValPipe_CIFAR(batch_size=batch_size, num_threads=num_threads, device_id=local_rank,
-                                      data_dir=image_dir,
-                                      crop=32, size=val_size, world_size=world_size, local_rank=local_rank,
-                                      INPUT_ITERATOR=INPUT_ITERATOR)
-        pip_val.build()
-        dali_iter_val = DALIClassificationIterator(pip_val, size=10000 // world_size)
-        return dali_iter_val
+        dali_iter_validation = None
+        if len(val_idxs):
+            pip_val = HybridValPipe_CIFAR(batch_size=batch_size, num_threads=num_threads, device_id=local_rank,
+                                          input_iterator=InputIterator(batch_size, root=image_dir, indices=val_idxs))
+            pip_val.build()
+            dali_iter_validation = DALIClassificationIterator(pip_val, size=len(val_idxs))
 
+        return dali_iter_train, dali_iter_validation
 
-def get_cifar_iter_torch(type, image_dir, batch_size, num_threads, cutout=0):
-    CIFAR_MEAN = [0.49139968, 0.48215827, 0.44653124]
-    CIFAR_STD = [0.24703233, 0.24348505, 0.26158768]
-    if type == 'train':
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-        ])
-        train_dst = CIFAR10(root=image_dir, train=True, download=True, transform=transform_train)
-        train_iter = torch.utils.data.DataLoader(train_dst, batch_size=batch_size, shuffle=True, pin_memory=True,
-                                                 num_workers=num_threads)
-        return train_iter
+    elif type == 'test':
+        pip_test = HybridValPipe_CIFAR(batch_size=batch_size, num_threads=num_threads, device_id=local_rank,
+                                       input_iterator=InputIterator(batch_size, type="test", root=image_dir))
+        pip_test.build()
+        dali_iter_test = DALIClassificationIterator(pip_test, size=10000)
+        return dali_iter_test
     else:
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-        ])
-        test_dst = CIFAR10(root=image_dir, train=False, download=True, transform=transform_test)
-        test_iter = torch.utils.data.DataLoader(test_dst, batch_size=batch_size, shuffle=False, pin_memory=True,
-                                                num_workers=num_threads)
-        return test_iter
+        exit(f"type={type} is not valid")
 
 
 if __name__ == '__main__':
     from distill.plot_batch import plot_batch
-    train_loader = get_cifar_iter_dali(type='val', image_dir='/local_storage/datasets', batch_size=256, num_threads=4,
-                                       version="cifar100")
+
+    train_loader, val_loader = get_cifar_iter_dali(type='train',
+                                                   image_dir='/home/vladimir/workspace/distilation_comparison/data',
+                                                   batch_size=256, num_threads=4, version="cifar100", local_rank=2,
+                                                   val_ratio=.2)
     print('start iterate')
+    n_tr_samples = 0
     start = time.time()
     for i, data in enumerate(train_loader):
         images = data[0]["data"].cuda(non_blocking=True)
         labels = data[0]["label"].squeeze().long().cuda(non_blocking=True)
-        plot_batch(images)
-
-        break
+        n_tr_samples+=labels.size(0)
     end = time.time()
+    print(f"Number of training samples: {n_tr_samples}")
     print('end iterate')
     print('dali iterate time: %fs' % (end - start))
 
-    # train_loader = get_cifar_iter_torch(type='train', image_dir='/userhome/memory_data/cifar10', batch_size=256,
-    #                                     num_threads=4)
-    # print('start iterate')
-    # start = time.time()
-    # for i, data in enumerate(train_loader):
-    #     images = data[0].cuda(non_blocking=True)
-    #     labels = data[1].cuda(non_blocking=True)
-    # end = time.time()
-    # print('end iterate')
-    # print('dali iterate time: %fs' % (end - start))
+    print('start iterate')
+    n_val_samples = 0
+    start = time.time()
+    for i, data in enumerate(val_loader):
+        images = data[0]["data"].cuda(non_blocking=True)
+        labels = data[0]["label"].squeeze().long().cuda(non_blocking=True)
+        n_val_samples+=labels.size(0)
+    end = time.time()
+    print(f"number of validation samples: {n_val_samples}")
+    print('end iterate')
+    print('dali iterate time: %fs' % (end - start))
