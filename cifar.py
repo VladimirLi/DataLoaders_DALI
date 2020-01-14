@@ -6,19 +6,43 @@ import numpy as np
 import nvidia.dali.ops as ops
 import nvidia.dali.types as types
 from nvidia.dali.pipeline import Pipeline
-from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+from nvidia.dali.plugin.pytorch import DALIClassificationIterator, DALIGenericIterator
+
 from sklearn.utils import shuffle
 
+
+# mean = {
+# 'cifar10': (0.4914, 0.4822, 0.4465),
+# 'cifar100': (0.5071, 0.4867, 0.4408),
+# }
+
+# std = {
+# 'cifar10': (0.2023, 0.1994, 0.2010),
+# 'cifar100': (0.2675, 0.2565, 0.2761),
+# }
+
+
+mean = {
+    'cifar100': [130.0183, 122.2212, 106.0015]
+}
+
+std = {
+    'cifar100': [65.9720, 64.2282, 70.0567]
+}
 
 class BasePipe(Pipeline):
     def __init__(self,
                  batch_size,
                  num_threads,
                  device_id,
+                 mean,
+                 std,
                  input_iterator=None,
+                 transform = True,
                  ):
         super(BasePipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         assert input_iterator is not None
+        self.transform = transform
         self.iterator = iter(input_iterator)
 
         self.input_image = ops.ExternalSource()
@@ -29,8 +53,8 @@ class BasePipe(Pipeline):
                                             output_dtype=types.FLOAT,
                                             output_layout=types.NCHW,
                                             image_type=types.RGB,
-                                            mean=[0.49139968 * 255., 0.48215827 * 255., 0.44653124 * 255.],
-                                            std=[0.24703233 * 255., 0.24348505 * 255., 0.26158768 * 255.])
+                                            mean=mean,
+                                            std=std)
 
     def iter_setup(self):
         (images, labels, index) = self.iterator.next()
@@ -46,18 +70,16 @@ class BasePipe(Pipeline):
         self.labels = self.input_label()
         self.index = self.input_index()
 
-        output = self.input_transform(self.jpegs.gpu())
+        if self.transform:
+            output = self.input_transform(self.jpegs.gpu())
+        else:
+            output = self.jpegs.gpu()
         return [output, self.labels, self.index]
 
 
 class HybridTrainPipeCIFAR(BasePipe):
-    def __init__(self,
-                 batch_size,
-                 num_threads,
-                 device_id,
-                 crop=32,
-                 input_iterator=None):
-        super(HybridTrainPipeCIFAR, self).__init__(batch_size, num_threads, device_id, input_iterator)
+    def __init__( self, crop=32, **kwargs):
+        super(HybridTrainPipeCIFAR, self).__init__(**kwargs)
 
         # Augmentation operations
         self.uniform = ops.Uniform(range=(0., 1.))
@@ -65,10 +87,6 @@ class HybridTrainPipeCIFAR(BasePipe):
 
         self.pad = ops.Paste(device="gpu", ratio=1.25, fill_value=0)
         self.crop = ops.Crop(device="gpu", crop_h=crop, crop_w=crop)
-        self.cmnp = ops.CropMirrorNormalize(device="gpu", output_dtype=types.FLOAT, output_layout=types.NCHW,
-                                            image_type=types.RGB,
-                                            mean=[0.49139968 * 255., 0.48215827 * 255., 0.44653124 * 255.],
-                                            std=[0.24703233 * 255., 0.24348505 * 255., 0.26158768 * 255.])
 
     def input_transform(self, images):
         output = self.pad(images)
@@ -78,12 +96,8 @@ class HybridTrainPipeCIFAR(BasePipe):
 
 
 class HybridValPipeCIFAR(BasePipe):
-    def __init__(self,
-                 batch_size,
-                 num_threads,
-                 device_id,
-                 input_iterator=None):
-        super(HybridValPipeCIFAR, self).__init__(batch_size, num_threads, device_id, input_iterator)
+    def __init__(self, **kwargs):
+        super(HybridValPipeCIFAR, self).__init__(**kwargs)
 
 
 class CifarInputIterator:
@@ -106,6 +120,7 @@ class CifarInputIterator:
                 self.targets.extend(entry['fine_labels'])
 
         self.data = np.vstack(self.data).reshape(-1, 3, 32, 32)
+        self.index = np.array(range(len(self.data))).astype(np.uint8)
         self.targets = np.vstack(self.targets).astype(np.uint8)
         self.data = self.data.transpose((0, 2, 3, 1))  # convert to HWC
 
@@ -124,12 +139,13 @@ class CifarInputIterator:
         idx = []
         for _ in range(self.batch_size):
             if self.i % self.n == 0:
-                self.data, self.targets = shuffle(self.data, self.targets, random_state=0)
+                self.data, self.targets, self.index = shuffle(self.data, self.targets, self.index, random_state=0)
                 # return (batch, labels)
-            img, label = self.data[self.i], self.targets[self.i]
+            img, label, index = self.data[self.i], self.targets[self.i], self.index[self.i]
+
             batch.append(img)
             labels.append(label)
-            idx.append(self.i)
+            idx.append(index)
             self.i = (self.i + 1) % self.n
         return batch, labels, idx
 
@@ -168,7 +184,8 @@ def get_cifar_iter_dali(
         image_dir,
         batch_size,
         num_threads,
-        version="cifar10"
+        version="cifar10",
+        transform=True,
 ):
     assert version == "cifar100", f"Cifar10 is not yet available"
     InputIterator = Cifar100InputIterator
@@ -178,18 +195,19 @@ def get_cifar_iter_dali(
 
     if "train" in type_:
         input_iterator = InputIterator(batch_size, file_name=type_, root=image_dir)
-        pipe_train = HybridTrainPipeCIFAR(batch_size=batch_size, num_threads=num_threads,
-                                           device_id=0, crop=32,
-                                           input_iterator=input_iterator)
+        pipe_train = HybridTrainPipeCIFAR(crop=32, 
+                batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
+                std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_train.build()
-        dali_iter_train = DALIClassificationIterator(pipe_train, size=len(input_iterator), fill_last_batch=False,
-                                                     last_batch_padded=True)
+        dali_iter_train = DALIGenericIterator(pipe_train, output_map=["data", "label", "index"], size=len(input_iterator), 
+                fill_last_batch=False, last_batch_padded=True)
         return dali_iter_train
     else:
         input_iterator = InputIterator(batch_size, file_name=type_, root=image_dir)
-        pipe_test = HybridValPipeCIFAR(batch_size=batch_size, num_threads=num_threads,
-                                        device_id=0, input_iterator=input_iterator)
+        pipe_test = HybridValPipeCIFAR(
+                batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
+                std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_test.build()
-        dali_iter_test = DALIClassificationIterator(pipe_test, size=len(input_iterator), fill_last_batch=False,
-                                                    last_batch_padded=True)
+        dali_iter_test = DALIGenericIterator(pipe_test, output_map=["data", "label", "index"], size=len(input_iterator), 
+                fill_last_batch=False, last_batch_padded=True)
         return dali_iter_test
