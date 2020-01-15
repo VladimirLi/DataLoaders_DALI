@@ -11,24 +11,16 @@ from nvidia.dali.plugin.pytorch import DALIClassificationIterator, DALIGenericIt
 from sklearn.utils import shuffle
 
 
-# mean = {
-# 'cifar10': (0.4914, 0.4822, 0.4465),
-# 'cifar100': (0.5071, 0.4867, 0.4408),
-# }
-
-# std = {
-# 'cifar10': (0.2023, 0.1994, 0.2010),
-# 'cifar100': (0.2675, 0.2565, 0.2761),
-# }
-
-
 mean = {
-    'cifar100': [130.0183, 122.2212, 106.0015]
+    'cifar10':  (0.4914 * 255., 0.4822 *255., 0.4465 *255.),
+    'cifar100': (0.5071 * 255., 0.4867 *255., 0.4408 *255.),
 }
 
 std = {
-    'cifar100': [65.9720, 64.2282, 70.0567]
+    'cifar10':  (0.2023 *255., 0.1994 *255., 0.2010 *255.),
+    'cifar100': (0.2675 *255., 0.2565 *255., 0.2761 *255.),
 }
+
 
 class BasePipe(Pipeline):
     def __init__(self,
@@ -48,6 +40,8 @@ class BasePipe(Pipeline):
         self.input_image = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
         self.input_index = ops.ExternalSource()
+        self.input_pos_index = ops.ExternalSource()
+        self.input_neg_index = ops.ExternalSource()
 
         self.cmnp = ops.CropMirrorNormalize(device="gpu",
                                             output_dtype=types.FLOAT,
@@ -57,10 +51,12 @@ class BasePipe(Pipeline):
                                             std=std)
 
     def iter_setup(self):
-        (images, labels, index) = self.iterator.next()
+        (images, labels, index, pos_idx, neg_idx) = self.iterator.next()
         self.feed_input(self.jpegs, images, layout=types.NHWC)  # can only in HWC order
         self.feed_input(self.labels, labels)
         self.feed_input(self.index, index)
+        self.feed_input(self.pos_index, pos_idx)
+        self.feed_input(self.neg_index, neg_idx)
 
     def input_transform(self, images):
         return self.cmnp(images)
@@ -69,12 +65,15 @@ class BasePipe(Pipeline):
         self.jpegs = self.input_image()
         self.labels = self.input_label()
         self.index = self.input_index()
+        self.pos_index = self.input_pos_index()
+        self.neg_index = self.input_neg_index()
+
 
         if self.transform:
             output = self.input_transform(self.jpegs.gpu())
         else:
             output = self.jpegs.gpu()
-        return [output, self.labels, self.index]
+        return [output, self.labels, self.index, self.pos_index, self.neg_index]
 
 
 class HybridTrainPipeCIFAR(BasePipe):
@@ -101,9 +100,11 @@ class HybridValPipeCIFAR(BasePipe):
 
 
 class CifarInputIterator:
-    def __init__(self, batch_size, file_name, root):
+    def __init__(self, batch_size, file_name, root, percent=1.0, k=None, mode=None):
         self.root = root
         self.batch_size = batch_size
+        self.k = k
+        self.mode = mode
 
         self.data = []
         self.targets = []
@@ -120,9 +121,37 @@ class CifarInputIterator:
                 self.targets.extend(entry['fine_labels'])
 
         self.data = np.vstack(self.data).reshape(-1, 3, 32, 32)
-        self.index = np.array(range(len(self.data))).astype(np.uint8)
+        self.index = np.array(range(len(self.data)))
         self.targets = np.vstack(self.targets).astype(np.uint8)
         self.data = self.data.transpose((0, 2, 3, 1))  # convert to HWC
+        
+        num_classes = len(np.unique(self.targets))
+        num_samples = len(self.data)
+        label = self.targets
+
+        # >> Copy from https://github.com/HobbitLong/RepDistiller/blob/master/dataset/cifar100.py
+        self.cls_positive = [[] for i in range(num_classes)]
+        for i in range(num_samples):
+            self.cls_positive[int(label[i])].append(i)
+
+        self.cls_negative = [[] for i in range(num_classes)]
+        for i in range(num_classes):
+            for j in range(num_classes):
+                if j == i:
+                    continue
+                self.cls_negative[i].extend(self.cls_positive[j])
+
+        self.cls_positive = [np.asarray(self.cls_positive[i]) for i in range(num_classes)]
+        self.cls_negative = [np.asarray(self.cls_negative[i]) for i in range(num_classes)]
+
+        if 0 < percent < 1:
+            n = int(len(self.cls_negative[0]) * percent)
+            self.cls_negative = [np.random.permutation(self.cls_negative[i])[0:n]
+                                 for i in range(num_classes)]
+
+        self.cls_positive = np.asarray(self.cls_positive)
+        self.cls_negative = np.asarray(self.cls_negative)
+        # <<
 
     def __len__(self):
         return len(self.data)
@@ -137,6 +166,8 @@ class CifarInputIterator:
         batch = []
         labels = []
         idx = []
+        pos_idxs = []
+        neg_idxs = []
         for _ in range(self.batch_size):
             if self.i % self.n == 0:
                 self.data, self.targets, self.index = shuffle(self.data, self.targets, self.index, random_state=0)
@@ -146,8 +177,30 @@ class CifarInputIterator:
             batch.append(img)
             labels.append(label)
             idx.append(index)
+
+            # >> Copy from https://github.com/HobbitLong/RepDistiller/blob/master/dataset/cifar100.py
+            if self.k is not None and self.k!=0:
+                if self.mode == 'exact':
+                    pos = index
+                elif self.mode == 'relax':
+                    pos = np.random.choice(self.cls_positive[int(label)], 1)
+                    pos = pos[0]
+                else:
+                    raise NotImplementedError(self.mode)
+                replace = True if self.k > len(self.cls_negative[int(label)]) else False
+                neg = np.random.choice(self.cls_negative[int(label)], self.k, replace=replace)
+                pos_idxs.append(pos)
+                neg_idxs.append(neg)
+            # <<
+            else:
+                pos_idxs.append(np.array(-1))
+                neg_idxs.append(np.array(-1))
+
+
+
             self.i = (self.i + 1) % self.n
-        return batch, labels, idx
+
+        return batch, labels, idx, pos_idxs, neg_idxs
 
     next = __next__
 
@@ -186,6 +239,8 @@ def get_cifar_iter_dali(
         num_threads,
         version="cifar10",
         transform=True,
+        k = None,
+        mode = None,
 ):
     assert version == "cifar100", f"Cifar10 is not yet available"
     InputIterator = Cifar100InputIterator
@@ -194,12 +249,12 @@ def get_cifar_iter_dali(
     assert type_ in ["train", "test", "sub_train", "sub_val"]
 
     if "train" in type_:
-        input_iterator = InputIterator(batch_size, file_name=type_, root=image_dir)
+        input_iterator = InputIterator(batch_size, k = k, mode = mode, file_name=type_, root=image_dir)
         pipe_train = HybridTrainPipeCIFAR(crop=32, 
                 batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
                 std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_train.build()
-        dali_iter_train = DALIGenericIterator(pipe_train, output_map=["data", "label", "index"], size=len(input_iterator), 
+        dali_iter_train = DALIGenericIterator(pipe_train, output_map=["data", "label", "index", "positive_index", "negative_index"], size=len(input_iterator), 
                 fill_last_batch=False, last_batch_padded=True)
         return dali_iter_train
     else:
@@ -208,6 +263,6 @@ def get_cifar_iter_dali(
                 batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
                 std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_test.build()
-        dali_iter_test = DALIGenericIterator(pipe_test, output_map=["data", "label", "index"], size=len(input_iterator), 
+        dali_iter_test = DALIGenericIterator(pipe_test, output_map=["data", "label", "index", "positive_index", "negative_index"], size=len(input_iterator), 
                 fill_last_batch=False, last_batch_padded=True)
         return dali_iter_test
