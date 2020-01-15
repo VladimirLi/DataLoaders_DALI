@@ -6,10 +6,8 @@ import numpy as np
 import nvidia.dali.ops as ops
 import nvidia.dali.types as types
 from nvidia.dali.pipeline import Pipeline
-from nvidia.dali.plugin.pytorch import DALIClassificationIterator, DALIGenericIterator
-
+from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from sklearn.utils import shuffle
-
 
 mean = {
     'cifar10':  (0.4914 * 255., 0.4822 *255., 0.4465 *255.),
@@ -249,20 +247,24 @@ def get_cifar_iter_dali(
     assert type_ in ["train", "test", "sub_train", "sub_val"]
 
     if "train" in type_:
-        input_iterator = InputIterator(batch_size, k = k, mode = mode, file_name=type_, root=image_dir)
-        pipe_train = HybridTrainPipeCIFAR(crop=32, 
-                batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
-                std=std[version], input_iterator=input_iterator, transform=transform)
+        input_iterator = InputIterator(batch_size, k=k, mode=mode, file_name=type_, root=image_dir)
+        pipe_train = HybridTrainPipeCIFAR(crop=32,
+                                          batch_size=batch_size, num_threads=num_threads, device_id=0,
+                                          mean=mean[version],
+                                          std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_train.build()
-        dali_iter_train = DALIGenericIterator(pipe_train, output_map=["data", "label", "index", "positive_index", "negative_index"], size=len(input_iterator), 
-                fill_last_batch=False, last_batch_padded=True)
-        return dali_iter_train
+        dali_iter = DALIGenericIterator(pipe_train,
+                                        output_map=["data", "label", "index", "positive_index", "negative_index"],
+                                        size=len(input_iterator),
+                                        fill_last_batch=False, last_batch_padded=True)
     else:
         input_iterator = InputIterator(batch_size, file_name=type_, root=image_dir)
         pipe_test = HybridValPipeCIFAR(
-                batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version], 
-                std=std[version], input_iterator=input_iterator, transform=transform)
+            batch_size=batch_size, num_threads=num_threads, device_id=0, mean=mean[version],
+            std=std[version], input_iterator=input_iterator, transform=transform)
         pipe_test.build()
-        dali_iter_test = DALIGenericIterator(pipe_test, output_map=["data", "label", "index", "positive_index", "negative_index"], size=len(input_iterator), 
-                fill_last_batch=False, last_batch_padded=True)
-        return dali_iter_test
+        dali_iter = DALIGenericIterator(pipe_test,
+                                        output_map=["data", "label", "index", "positive_index", "negative_index"],
+                                        size=len(input_iterator),
+                                        fill_last_batch=False, last_batch_padded=True)
+    return dali_iter, len(input_iterator)
